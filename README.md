@@ -10,92 +10,155 @@ This project is licensed under the **Anti-Military License**—see the `LICENSE`
 This project incorporates code from third-party sources which are governed by different licenses. Full compliance information, including the original copyright notices and terms for these dependencies, can be found in the **`NOTICE`** file in the repository root.
 
 ## File structure
-- score_hyperidentity.h: Implements the mining and scoring logic using hyperidentity algorithm.
-- score_addition.h: Implements the mining and scoring logic using addition algorithm.
-- score_common.h: shared functions using for scoring
-- Qiner.cpp: Contains the main process logic/functionality. Mainly show how to communicate with the node.
-- K12AndKeyUtill.h, keyUtils.h, keyUtils.cpp: Provide K12 and key conversion utilities/functions.
+- `Qiner.cpp`: Main miner entrypoint and node communication.
+- `score_hyperidentity.h`: Mining and scoring logic for the hyperidentity algorithm.
+- `score_addition.h`: Mining and scoring logic for the addition algorithm.
+- `score_common.h`: Shared helpers used by both scoring algorithms.
+- `K12AndKeyUtill.h`, `keyUtils.h`, `keyUtils.cpp`: KangarooTwelve hash and key conversion utilities.
+- `src/`: Core miner sources (platform abstractions, main logic).
+- `src/cuda/score_addition_cuda.cu`: CUDA port of the addition `computeScore` function (GPU mining).
+- `tools/`: Helper binaries (GPU/CPU verify tool, benchmarks, test-vector generator).
+- `test/`: Tests for scoring and CUDA paths.
 
 # Requirement
-- CPU: support at least AVX2 instruction set
-- OS: Windows, Linux
+- **CPU:** x86-64. AVX2 is recommended for best CPU mining performance, but not required if you build with the **Hybrid** option.
+- **OS:** Windows, Linux.
+- **GPU:** NVIDIA GPU (Turing / sm_75 or newer) with a driver that supports your CUDA toolkit version.
+  - **Windows:** Install the latest NVIDIA driver, then install the CUDA Toolkit (13.1) from `developer.nvidia.com/cuda-downloads`. Check `nvidia-smi` and ensure “CUDA Version” is ≥ your toolkit version.
+  - **Linux:** Install the NVIDIA driver from your distro or NVIDIA’s website, and the matching CUDA Toolkit (or use the Docker CUDA image, which bundles CUDA 11.8). Use `nvidia-smi` to confirm the driver supports the toolkit version.
+
+See [Building with CUDA (GPU)](#building-with-cuda-gpu) below for configure, build, tests, and troubleshooting.
+
+# Git Clone
+```
+git clone repo
+cd repo
+```
 
 # Build
-## Windows
-### Visual Studio 2022
-- Open Qiner.sln
-- Build
-### Other Visual Studio versions
 
-- Support generation using CMake with below command
+
+## Windows
+### Visual Studio (CPU-only)
+
+From the Qiner folder, generate the solution and build:
 ```
-# Assume in Qiner folder
 mkdir build
 cd build
-"C:\Program Files\CMake\bin\cmake.exe" -G <Visual Studio Generator>
-# Example: C:\Program Files\CMake\bin\cmake.exe" -G "Visual Studio 17 2022"
+"C:\Program Files\CMake\bin\cmake.exe" -G "Visual Studio 17 2022" -A x64 -DCMAKE_BUILD_TYPE=Release
 ```
-- Open Qiner.sln in build folder and build
+Open `build\Qiner.sln` and build.
+
+### Hybrid / GPU build (Visual Studio + CUDA)
+
+To build with GPU support (hybrid: CPU threads + GPU addition mining), install the [NVIDIA driver and CUDA Toolkit](#requirement) first, then from the Qiner folder in **PowerShell**:
+
+```batch
+mkdir build
+cd build
+set CUDAToolkit_ROOT=C:\Program Files\NVIDIA GPU Computing Toolkit\CUDA\v13.1
+"C:\Program Files\CMake\bin\cmake.exe" .. -G "Visual Studio 17 2022" -A x64 -DCMAKE_BUILD_TYPE=Release -DBUILD_TOOLS=ON -DBUILD_CUDA=ON -DCUDAToolkit_ROOT="%CUDAToolkit_ROOT%"
+```
+Open `build\Qiner.sln` and build **Release**. Run with CPU threads and GPU batch, e.g. `Qiner.exe <NodeIP> <Port> <MiningID> <SigningSeed> <MiningSeed> 4 256` (4 CPU threads, GPU batch 256).
+
+If CUDA is installed elsewhere, set `CUDAToolkit_ROOT` to that path (the folder containing `bin\nvcc.exe`).
 
 ### Enable AVX512
 - Open Qiner.sln
-- Right click Qiner->[C/C++]->[Code Generation]->[Enable Enhanced Instruction Set] -> [...AVX512] -> OK
+- Right click Qiner->[Properties]->[C/C++]->[Code Generation]->[Enable Enhanced Instruction Set] -> [...AVX512] -> OK
 
 ## Linux
-Currently support GCC and Clang
-- Installed required libraries
 
-For example,
-- Ubuntu with GCC
+Supports GCC and Clang. Example commands below are for **Ubuntu 22.04+**; other distros use equivalent packages.
+
+### Install CUDA (Linux, example: CUDA 13.1 on Ubuntu 22.04)
+
+- Add NVIDIA CUDA repo
+```bash
+wget https://developer.download.nvidia.com/compute/cuda/repos/ubuntu2204/x86_64/cuda-keyring_1.1-1_all.deb
+sudo dpkg -i cuda-keyring_1.1-1_all.deb
+sudo apt-get update
 ```
-sudo apt install build-essential
+- Install CUDA 13.1 toolkit
+```bash
+sudo apt-get install -y cuda-toolkit-13-1
 ```
-- Ubuntu with Clang
-```
-sudo apt install build-essential
-sudo apt install clang
+- Add to PATH
+```bash
+echo 'export PATH=/usr/local/cuda-13.1/bin:$PATH' >> ~/.bashrc
+echo 'export LD_LIBRARY_PATH=/usr/local/cuda-13.1
+lib64:$LD_LIBRARY_PATH' >> ~/.bashrc
+source ~/.bashrc
 ```
 
+### Install CMake and build tools (Linux)
 
-### GCC
-Run below command
+```bash
+sudo apt-get update
+sudo apt-get install -y build-essential cmake
 ```
-mkdir build
-cd build
+
+### GCC (CPU-only build)
+
+```bash
+mkdir build && cd build
 cmake .. -DCMAKE_BUILD_TYPE=Release
-make -j8
+make -j$(nproc)
 ```
 
-### Clang
-Run below command
-```
-mkdir build
-cd build
+### Clang (CPU-only build)
+
+```bash
+mkdir build && cd build
 CC=clang CXX=clang++ cmake .. -DCMAKE_BUILD_TYPE=Release
-make -j8
+make -j$(nproc)
+```
+
+
+### Build with CUDA on Linux (GPU support)
+
+After installing CUDA and CMake as above, build Qiner with CUDA enabled.
+
+```bash
+mkdir build && cd build
+cmake .. -DCMAKE_BUILD_TYPE=Release -DPORTABLE=ON -DBUILD_TOOLS=ON -DBUILD_CUDA=ON -DCUDAToolkit_ROOT=/usr/local/cuda-13.1
+make -j$(nproc)
 ```
 
 ### Enable AVX512
-To enable AVX512, -DENABLE_AVX512=1 need to be parse in the cmake command.
 
-Example,
-```
-# GCC
-cmake .. -DCMAKE_BUILD_TYPE=Release -DENABLE_AVX512=1
+Add `-DENABLE_AVX512=1` to the cmake line (e.g. `cmake .. -DCMAKE_BUILD_TYPE=Release -DENABLE_AVX512=1`; with Clang prefix `CC=clang CXX=clang++`).
 
-# Clang
-CC=clang CXX=clang++ cmake .. -DCMAKE_BUILD_TYPE=Release -DENABLE_AVX512=1
+
+## Run CUDA verify score / tools
+
+From `build`:
+- Windows
+```powershell
+.\bin\Release\score_addition_verify.exe
 ```
+- Linux
+```bash
+./bin/score_addition_verify
+```
+
+- **Verify:** Compares CPU vs GPU scores; expect `Verification PASSED`.
 
 # Run
+- Windows
 ```
-./Qiner <Node IP> <Node Port> <MiningID> <Signing Seed> <Mining Seed> <Number of threads>
+Qiner.exe <Node IP> <Node Port> <MiningID> <Signing Seed> <Mining Seed> <Number of threads> <Batch Size(Optional)>
 ```
+- Linux
+```
+./Qiner <Node IP> <Node Port> <MiningID> <Signing Seed> <Mining Seed> <Number of threads> <Batch Size(Optional)>
+```
+
+For guidance on choosing the number of threads (GPU-only, CPU-only, or hybrid), see **[docs/MINING.md](docs/MINING.md)**.
 
 Example: 
 ```
-./Qiner 192.168.1.2 31841 BZBQFLLBNCXEMGLOBHUVFTLUPLVCPQUASSILFABOFFBCADQSSUPNWLZBQEXK aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa aaaaaaaaaa
-aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa 8
+./Qiner 192.168.1.2 31841 BZBQFLLBNCXEMGLOBHUVFTLUPLVCPQUASSILFABOFFBCADQSSUPNWLZBQEXK aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa 8 256
 ```
 
 # Algorithm 2025-05-15 (hyperidentity)

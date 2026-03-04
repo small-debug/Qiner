@@ -14,16 +14,67 @@
 
 #else
 #include <signal.h>
+#ifndef PORTABLE
 #include <immintrin.h>
+#endif
 #include <arpa/inet.h>
 #include <sys/socket.h>
 #include <unistd.h>
 
 #endif
 
+#include <cstdint>
+#include <random>
+#if defined(PORTABLE) && defined(__linux__)
+#include <fcntl.h>
+#include <unistd.h>
+#endif
+
+#ifdef PORTABLE
+static void portable_rand_bytes(void* buf, size_t len)
+{
+#if defined(__linux__)
+    int fd = open("/dev/urandom", O_RDONLY);
+    if (fd >= 0)
+    {
+        size_t n = 0;
+        while (n < len)
+        {
+            ssize_t r = read(fd, (char*)buf + n, len - n);
+            if (r <= 0) break;
+            n += (size_t)r;
+        }
+        close(fd);
+        if (n == len) return;
+    }
+#endif
+    std::random_device rd;
+    for (size_t i = 0; i < len; ++i)
+        ((unsigned char*)buf)[i] = (unsigned char)(rd() & 0xFF);
+}
+static inline int portable_rdrand32_step(unsigned int* p)
+{
+    portable_rand_bytes(p, 4);
+    return 1;
+}
+static inline int portable_rdrand64_step(unsigned long long* p)
+{
+    portable_rand_bytes(p, 8);
+    return 1;
+}
+#endif
+
 #include "score_hyperidentity.h"
 #include "score_addition.h"
+#include "score_common.h"
 #include "keyUtils.h"
+
+#ifdef BUILD_CUDA_ADDITION
+#include "cuda/score_addition_cuda.h"
+#endif
+
+#include <chrono>
+#include <iostream>
 
 struct RequestResponseHeader
 {
@@ -33,9 +84,9 @@ private:
     unsigned int _dejavu;
 
 public:
-    inline unsigned int size()
+    inline unsigned int size() const
     {
-        return (*((unsigned int*)_size)) & 0xFFFFFF;
+        return (unsigned int)_size[0] | ((unsigned int)_size[1] << 8) | ((unsigned int)_size[2] << 16);
     }
 
     inline void setSize(unsigned int size)
@@ -68,7 +119,11 @@ public:
 
     inline void randomizeDejavu()
     {
+#ifdef PORTABLE
+        portable_rdrand32_step(&_dejavu);
+#else
         _rdrand32_step(&_dejavu);
+#endif
         if (!_dejavu)
         {
             _dejavu = 1;
@@ -143,14 +198,6 @@ void consoleCtrlHandler()
 #endif
 }
 
-int getSystemProcs()
-{
-#ifdef _MSC_VER
-#else
-#endif
-    return 0;
-}
-
 struct Stat
 {
     std::atomic<unsigned long long> totalAdditionNonce;
@@ -196,10 +243,17 @@ int miningThreadProc()
     std::array<unsigned char, 32> nonce;
     while (!state)
     {
+#ifdef PORTABLE
+        portable_rdrand64_step((unsigned long long*)&nonce.data()[0]);
+        portable_rdrand64_step((unsigned long long*)&nonce.data()[8]);
+        portable_rdrand64_step((unsigned long long*)&nonce.data()[16]);
+        portable_rdrand64_step((unsigned long long*)&nonce.data()[24]);
+#else
         _rdrand64_step((unsigned long long*)&nonce.data()[0]);
         _rdrand64_step((unsigned long long*)&nonce.data()[8]);
         _rdrand64_step((unsigned long long*)&nonce.data()[16]);
         _rdrand64_step((unsigned long long*)&nonce.data()[24]);
+#endif
 
         bool solutionFound = false;
 
@@ -238,6 +292,78 @@ int miningThreadProc()
     }
     return 0;
 }
+
+#ifdef BUILD_CUDA_ADDITION
+static constexpr size_t GPU_ADDITION_BATCH_SIZE_DEFAULT = 256;
+static constexpr size_t GPU_ADDITION_BATCH_SIZE_MIN = 64;
+static constexpr size_t GPU_ADDITION_BATCH_SIZE_MAX = 4096;
+static size_t g_gpuAdditionBatchSize = GPU_ADDITION_BATCH_SIZE_DEFAULT;
+
+int gpuAdditionMiningThreadProc()
+{
+    size_t batchSize = g_gpuAdditionBatchSize;
+    std::vector<unsigned char> pool(POOL_VEC_PADDING_SIZE);
+    generateRandom2Pool(randomSeed, pool.data());
+
+    std::vector<std::array<unsigned char, 32>> nonceBatch;
+    nonceBatch.reserve(batchSize);
+    std::vector<unsigned char> noncesFlat(batchSize * 32);
+    std::vector<unsigned int> scores(batchSize);
+
+    while (!state)
+    {
+        nonceBatch.clear();
+        while (nonceBatch.size() < batchSize && !state)
+        {
+            std::array<unsigned char, 32> nonce;
+#ifdef PORTABLE
+            portable_rdrand64_step((unsigned long long*)&nonce[0]);
+            portable_rdrand64_step((unsigned long long*)&nonce[8]);
+            portable_rdrand64_step((unsigned long long*)&nonce[16]);
+            portable_rdrand64_step((unsigned long long*)&nonce[24]);
+#else
+            _rdrand64_step((unsigned long long*)&nonce[0]);
+            _rdrand64_step((unsigned long long*)&nonce[8]);
+            _rdrand64_step((unsigned long long*)&nonce[16]);
+            _rdrand64_step((unsigned long long*)&nonce[24]);
+#endif
+            if ((nonce[0] & 1) != 1)
+                continue;
+            nonceBatch.push_back(nonce);
+        }
+
+        if (nonceBatch.empty())
+            continue;
+
+        for (size_t i = 0; i < nonceBatch.size(); ++i)
+            std::memcpy(&noncesFlat[i * 32], nonceBatch[i].data(), 32);
+
+        int ok = score_addition_cuda_batch(
+            pool.data(), computorPublicKey, noncesFlat.data(),
+            scores.data(), nonceBatch.size());
+
+        if (!ok)
+            continue;
+
+        qinerStat.totalAdditionNonce.fetch_add(nonceBatch.size());
+
+        for (size_t i = 0; i < nonceBatch.size(); ++i)
+        {
+            numberOfMiningIterations++;
+            if (scores[i] >= score_addition::SOLUTION_THRESHOLD)
+            {
+                qinerStat.totalAdditionSols.fetch_add(1);
+                {
+                    std::lock_guard<std::mutex> guard(foundNonceLock);
+                    foundNonce.push(nonceBatch[i]);
+                }
+                numberOfFoundSolutions++;
+            }
+        }
+    }
+    return 0;
+}
+#endif
 
 struct ServerSocket
 {
@@ -362,12 +488,57 @@ static void hexToByte(const char* hex, uint8_t* byte, const int sizeInByte)
     }
 }
 
+void benchmark_addition_computeScore()
+{
+    // Fixed mining seed and public key for the benchmark
+    unsigned char miningSeed[32] = { 0 };
+    unsigned char publicKey[32] = { 0 };
+
+    AdditionMiner miner;
+    miner.initialize(miningSeed);
+
+    unsigned char nonce[32];
+
+    constexpr int kRuns = 10;
+    using clock = std::chrono::high_resolution_clock;
+
+    auto t0 = clock::now();
+    for (int i = 0; i < kRuns; ++i)
+    {
+        // Simple varying nonce per run
+        for (int j = 0; j < 32; ++j)
+        {
+            nonce[j] = static_cast<unsigned char>(i * 31 + j);
+        }
+
+        // Prevent the compiler from optimizing the call away
+        volatile unsigned int score = miner.computeScore(publicKey, nonce);
+        (void)score;
+    }
+    auto t1 = clock::now();
+
+    auto total_us =
+        std::chrono::duration_cast<std::chrono::microseconds>(t1 - t0).count();
+    double avg_us = static_cast<double>(total_us) / kRuns;
+
+    std::cout << "Total time for " << kRuns
+        << " computeScore() calls: " << total_us << " us\n";
+    std::cout << "Average time per nonce: " << avg_us << " us\n";
+}
+
 int main(int argc, char* argv[])
 {
     std::vector<std::thread> miningThreads;
-    if (argc != 7)
+    bool showHelp = (argc < 7 || argc > 8);
+    if (!showHelp && argc >= 2)
     {
-        printf("Usage:   Qiner [Node IP] [Node Port] [MiningID] [Signing Seed] [Mining Seed] [Number of threads]\n");
+        if (std::strcmp(argv[1], "-h") == 0 || std::strcmp(argv[1], "--help") == 0)
+            showHelp = true;
+    }
+    if (showHelp)
+    {
+        printf("Usage:   Qiner [Node IP] [Node Port] [MiningID] [Signing Seed] [Mining Seed] [Number of threads] [GPU batch size (optional)]\n");
+        return 0;
     }
     else
     {
@@ -397,8 +568,29 @@ int main(int argc, char* argv[])
 
             hexToByte(argv[5], randomSeed, 32);
             unsigned int numberOfThreads = atoi(argv[6]);
+#ifdef BUILD_CUDA_ADDITION
+            if (argc >= 8)
+            {
+                long batchArg = std::atoi(argv[7]);
+                if (batchArg < (long)GPU_ADDITION_BATCH_SIZE_MIN)
+                    g_gpuAdditionBatchSize = GPU_ADDITION_BATCH_SIZE_MIN;
+                else if (batchArg > (long)GPU_ADDITION_BATCH_SIZE_MAX)
+                    g_gpuAdditionBatchSize = GPU_ADDITION_BATCH_SIZE_MAX;
+                else
+                    g_gpuAdditionBatchSize = (size_t)batchArg;
+            }
+            else
+            {
+                g_gpuAdditionBatchSize = GPU_ADDITION_BATCH_SIZE_DEFAULT;
+            }
+            printf("%d threads are used. GPU batch size: %zu\n", numberOfThreads, g_gpuAdditionBatchSize);
+#else
             printf("%d threads are used.\n", numberOfThreads);
+#endif
             miningThreads.reserve(numberOfThreads);
+#ifdef BUILD_CUDA_ADDITION
+            miningThreads.emplace_back(gpuAdditionMiningThreadProc);
+#endif
             for (unsigned int i = numberOfThreads; i-- > 0; )
             {
                 miningThreads.emplace_back(miningThreadProc);
@@ -454,10 +646,17 @@ int main(int argc, char* argv[])
                         unsigned char gammingKey[32];
                         do
                         {
+#ifdef PORTABLE
+                            portable_rdrand64_step((unsigned long long*)&packet.message.gammingNonce[0]);
+                            portable_rdrand64_step((unsigned long long*)&packet.message.gammingNonce[8]);
+                            portable_rdrand64_step((unsigned long long*)&packet.message.gammingNonce[16]);
+                            portable_rdrand64_step((unsigned long long*)&packet.message.gammingNonce[24]);
+#else
                             _rdrand64_step((unsigned long long*) & packet.message.gammingNonce[0]);
                             _rdrand64_step((unsigned long long*) & packet.message.gammingNonce[8]);
                             _rdrand64_step((unsigned long long*) & packet.message.gammingNonce[16]);
                             _rdrand64_step((unsigned long long*) & packet.message.gammingNonce[24]);
+#endif
                             memcpy(&sharedKeyAndGammingNonce[32], packet.message.gammingNonce, 32);
                             KangarooTwelve(sharedKeyAndGammingNonce, 64, gammingKey, 32);
                         } while (gammingKey[0]);
@@ -505,6 +704,7 @@ int main(int argc, char* argv[])
                     printf("|   %04d-%02d-%02d %02d:%02d:%02d   |   %llu it/s   |   %d solutions   |   %.10s...   |\n",
                         utc_time->tm_year + 1900, utc_time->tm_mon, utc_time->tm_mday, utc_time->tm_hour, utc_time->tm_min, utc_time->tm_sec,
                         (numberOfMiningIterations - prevNumberOfMiningIterations) * 1000 / delta, numberOfFoundSolutions.load(), miningID);
+                    fflush(stdout);
                     prevNumberOfMiningIterations = numberOfMiningIterations;
                     timestamp = std::chrono::steady_clock::now();
                 }

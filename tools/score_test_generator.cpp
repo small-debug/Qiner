@@ -13,8 +13,15 @@
 #ifdef _MSC_VER
 #include <intrin.h>
 #else
+#ifndef PORTABLE
 #include <immintrin.h>
+#endif
+#endif
 
+#include <random>
+#if defined(PORTABLE) && defined(__linux__)
+#include <fcntl.h>
+#include <unistd.h>
 #endif
 
 #include "score_params.h"
@@ -22,6 +29,30 @@
 #include "score_addition.h"
 
 using namespace score_params;
+
+#ifdef PORTABLE
+static void portable_rand_bytes_32(void* buf)
+{
+#if defined(__linux__)
+    int fd = open("/dev/urandom", O_RDONLY);
+    if (fd >= 0)
+    {
+        size_t n = 0;
+        while (n < 32)
+        {
+            ssize_t r = read(fd, (char*)buf + n, 32 - n);
+            if (r <= 0) break;
+            n += (size_t)r;
+        }
+        close(fd);
+        if (n == 32) return;
+    }
+#endif
+    std::random_device rd;
+    for (int i = 0; i < 32; ++i)
+        ((unsigned char*)buf)[i] = (unsigned char)(rd() & 0xFF);
+}
+#endif
 
 union m256i
 {
@@ -37,10 +68,14 @@ union m256i
 
     void setRandomValue()
     {
+#ifdef PORTABLE
+        portable_rand_bytes_32(&m256i_u64[0]);
+#else
         _rdrand64_step(reinterpret_cast<unsigned long long *>(&m256i_u64[0]));
         _rdrand64_step(reinterpret_cast<unsigned long long *>(&m256i_u64[1]));
         _rdrand64_step(reinterpret_cast<unsigned long long *>(&m256i_u64[2]));
         _rdrand64_step(reinterpret_cast<unsigned long long *>(&m256i_u64[3]));
+#endif
     }
 };
 

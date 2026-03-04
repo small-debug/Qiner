@@ -8,7 +8,7 @@
 constexpr unsigned long long POOL_VEC_SIZE =  (((1ULL<<32) + 64)) >> 3; // 2^32+64 bits ~ 512MB
 constexpr unsigned long long POOL_VEC_PADDING_SIZE = (POOL_VEC_SIZE + 200 - 1) / 200 * 200; // padding for multiple of 200
 
-void generateRandom2Pool(unsigned char miningSeed[32], unsigned char* pool)
+inline void generateRandom2Pool(unsigned char miningSeed[32], unsigned char* pool)
 {
     unsigned char state[200];
     // same pool to be used by all computors/candidates and pool content changing each phase
@@ -22,7 +22,7 @@ void generateRandom2Pool(unsigned char miningSeed[32], unsigned char* pool)
     }
 }
 
-void random2(
+inline void random2(
     unsigned char seed[32],
     const unsigned char* pool,
     unsigned char* output,
@@ -86,7 +86,7 @@ char clampNeuron(T neuronValue)
     return static_cast<char>(neuronValue);
 }
 
-void extract64Bits(unsigned long long number, char* output)
+inline void extract64Bits(unsigned long long number, char* output)
 {
     for (int i = 0; i < 64; ++i)
     {
